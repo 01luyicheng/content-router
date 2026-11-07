@@ -35,10 +35,24 @@ except ImportError:
     print("警告: 未安装 requests 库，使用 urllib (性能较差)")
     print("建议: pip install requests")
 
-# 配置
-LITELLM_BASE = "http://localhost:4000"
-DEFAULT_MODEL = "openclaw-main"
-VISION_MODEL = "openclaw-vision"
+def _env_int(name, default):
+    """读取整型环境变量；未设置时返回默认值，非法值直接报错退出。"""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise SystemExit(f"{name} 必须是整数，当前为 {raw!r}")
+    if value <= 0:
+        raise SystemExit(f"{name} 必须为正整数，当前为 {value}")
+    return value
+
+
+# 配置（均可用环境变量覆盖）
+LITELLM_BASE = os.environ.get("LITELLM_BASE", "http://localhost:4000").rstrip("/")
+DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "openclaw-main")
+VISION_MODEL = os.environ.get("VISION_MODEL", "openclaw-vision")
 
 # 预编译正则表达式 - 用于多模态检测
 # 限制 URL 长度防止 ReDoS 攻击
@@ -55,13 +69,34 @@ MULTIMODAL_PATTERNS = [re.compile(p, re.IGNORECASE) for p in [
 LOG_SANITIZE_PATTERN = re.compile(r'[\x00-\x1F\x7F]')
 
 # 安全限制
-MAX_REQUEST_SIZE = 500 * 1024 * 1024   # 500MB 最大请求大小
-MAX_BODY_SIZE = 500 * 1024 * 1024      # 500MB 最大响应大小
+MAX_REQUEST_SIZE = _env_int("MAX_REQUEST_SIZE", 500 * 1024 * 1024)   # 500MB 最大请求大小
+MAX_BODY_SIZE = _env_int("MAX_BODY_SIZE", 500 * 1024 * 1024)         # 500MB 最大响应大小
 
-# 日志配置
-LOG_DIR = "/var/log/openclaw"
-LOG_FILE = os.path.join(LOG_DIR, "gateway.log")
-os.makedirs(LOG_DIR, exist_ok=True)
+# 日志配置：优先使用 LOG_DIR，不可写时退回脚本同级的 logs/ 目录
+def _resolve_log_dir():
+    """返回一个可写的日志目录；全部候选都不可写时返回 None（仅保留控制台日志）。"""
+    candidates = []
+    if os.environ.get("LOG_DIR"):
+        candidates.append(os.environ["LOG_DIR"])
+    else:
+        candidates.append("/var/log/openclaw")
+    candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs"))
+
+    for candidate in candidates:
+        try:
+            os.makedirs(candidate, exist_ok=True)
+            probe = os.path.join(candidate, ".write-probe")
+            with open(probe, "w", encoding="utf-8"):
+                pass
+            os.remove(probe)
+            return candidate
+        except OSError:
+            continue
+    return None
+
+
+LOG_DIR = _resolve_log_dir()
+LOG_FILE = os.path.join(LOG_DIR, "gateway.log") if LOG_DIR else None
 
 # 设置日志 - 使用轮转
 logger = logging.getLogger('openclaw-gateway')
@@ -69,14 +104,17 @@ logger.setLevel(logging.INFO)
 formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
 
 # 文件日志 - 轮转，最大100MB，保留5个备份
-file_handler = RotatingFileHandler(
-    LOG_FILE,
-    maxBytes=100*1024*1024,  # 100MB
-    backupCount=5,
-    encoding='utf-8'
-)
-file_handler.setFormatter(formatter)
-logger.addHandler(file_handler)
+if LOG_FILE:
+    file_handler = RotatingFileHandler(
+        LOG_FILE,
+        maxBytes=100*1024*1024,  # 100MB
+        backupCount=5,
+        encoding='utf-8'
+    )
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+else:
+    print("警告: 没有可写的日志目录，仅输出控制台日志（可用 LOG_DIR 指定目录）")
 
 # 控制台日志
 console_handler = logging.StreamHandler()
@@ -676,17 +714,20 @@ class OpenClawHandler(BaseHTTPRequestHandler):
             litellm_healthy = False
             litellm_error = None
             sock = None
+            upstream = urllib.parse.urlsplit(LITELLM_BASE)
+            upstream_host = upstream.hostname or 'localhost'
+            upstream_port = upstream.port or (443 if upstream.scheme == 'https' else 80)
             
             try:
                 import socket
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.settimeout(2)
-                sock.connect(('localhost', 4000))
+                sock.connect((upstream_host, upstream_port))
                 litellm_healthy = True
             except socket.timeout:
-                litellm_error = "Connection to LiteLLM port 4000 timed out"
+                litellm_error = f"Connection to LiteLLM {upstream_host}:{upstream_port} timed out"
             except ConnectionRefusedError:
-                litellm_error = "Connection to LiteLLM port 4000 refused"
+                litellm_error = f"Connection to LiteLLM {upstream_host}:{upstream_port} refused"
             except Exception as e:
                 litellm_error = str(e)
             finally:
